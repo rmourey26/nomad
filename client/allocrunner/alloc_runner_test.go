@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/hashicorp/consul/api"
+	multierror "github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/nomad/client/allochealth"
 	"github.com/hashicorp/nomad/client/allocwatcher"
 	cconsul "github.com/hashicorp/nomad/client/consul"
@@ -1567,4 +1568,257 @@ func TestAllocRunner_PersistState_Destroyed(t *testing.T) {
 	_, ts, err = conf.StateDB.GetTaskRunnerState(alloc.ID, taskName)
 	require.NoError(t, err)
 	require.Nil(t, ts)
+}
+
+func TestAllocRunner_Restart(t *testing.T) {
+
+	alloc := mock.LifecycleAlloc()
+	alloc.Job.Type = structs.JobTypeService
+	alloc.Job.TaskGroups[0].Tasks = []*structs.Task{}
+
+	// helper for constructing lifecycle tasks. The LifecycleAlloc and
+	// LifecycleJob don't have *all* the possible lifecycle options, and the
+	// allocrunner needs the resource fields filled out.
+	//
+	// TODO: should this larger set just get moved to the mock? We'll
+	// want to check who else is using it
+	addTask := func(name, runFor string, lc *structs.TaskLifecycleConfig) {
+		alloc.Job.TaskGroups[0].Tasks = append(alloc.Job.TaskGroups[0].Tasks,
+			&structs.Task{
+				Name:      name,
+				Driver:    "mock_driver",
+				Config:    map[string]interface{}{"run_for": runFor},
+				Lifecycle: lc,
+				LogConfig: structs.DefaultLogConfig(),
+				Resources: &structs.Resources{CPU: 100, MemoryMB: 256},
+			},
+		)
+		alloc.TaskResources[name] = &structs.Resources{CPU: 100, MemoryMB: 256}
+		alloc.AllocatedResources.Tasks[name] = &structs.AllocatedTaskResources{
+			Cpu:    structs.AllocatedCpuResources{CpuShares: 100},
+			Memory: structs.AllocatedMemoryResources{MemoryMB: 256},
+		}
+	}
+
+	addTask("main", "100s", nil)
+	addTask("prestart-oneshot", "1s", &structs.TaskLifecycleConfig{
+		Hook:    structs.TaskLifecycleHookPrestart,
+		Sidecar: false,
+	})
+	addTask("prestart-sidecar", "100s", &structs.TaskLifecycleConfig{
+		Hook:    structs.TaskLifecycleHookPrestart,
+		Sidecar: true,
+	})
+	addTask("poststart-oneshot", "1s", &structs.TaskLifecycleConfig{
+		Hook:    structs.TaskLifecycleHookPrestart,
+		Sidecar: false,
+	})
+	addTask("poststart-sidecar", "100s", &structs.TaskLifecycleConfig{
+		Hook:    structs.TaskLifecycleHookPrestart,
+		Sidecar: true,
+	})
+	addTask("poststop", "1s", &structs.TaskLifecycleConfig{
+		Hook: structs.TaskLifecycleHookPoststop,
+	})
+
+	testCases := []struct {
+		name          string
+		action        func(*allocRunner, *structs.Allocation) error
+		expectedAfter map[string]structs.TaskState
+	}{
+		{
+			name: "restart entire allocation",
+			action: func(ar *allocRunner, alloc *structs.Allocation) error {
+				// TODO: is there useful test info we could get from a TaskEvent here?
+				ar.RestartAll(&structs.TaskEvent{})
+				return nil
+			},
+			expectedAfter: map[string]structs.TaskState{
+				"main": structs.TaskState{
+					State:    structs.TaskStateRunning,
+					Restarts: 1,
+				},
+				"prestart-oneshot": structs.TaskState{
+					State:    structs.TaskStateDead,
+					Restarts: 0, // TODO: is this true?
+				},
+				"prestart-sidecar": structs.TaskState{
+					State:    structs.TaskStateRunning,
+					Restarts: 1, // TODO: is this true?
+				},
+				"poststart-oneshot": structs.TaskState{
+					State:    structs.TaskStateDead,
+					Restarts: 0, // TODO: is this true?
+				},
+				"poststart-sidecar": structs.TaskState{
+					State:    structs.TaskStateRunning,
+					Restarts: 1, // TODO: is this true?
+				},
+				"poststop": structs.TaskState{
+					State:    structs.TaskStatePending,
+					Restarts: 0,
+				},
+			},
+		},
+
+		{
+			name: "restart main task",
+			action: func(ar *allocRunner, alloc *structs.Allocation) error {
+				ar.RestartTask("main", &structs.TaskEvent{})
+				return nil
+			},
+			expectedAfter: map[string]structs.TaskState{
+				"main": structs.TaskState{
+					State:    structs.TaskStateRunning,
+					Restarts: 1,
+				},
+				"prestart-oneshot": structs.TaskState{
+					State:    structs.TaskStateDead,
+					Restarts: 0, // TODO: is this true?
+				},
+				"prestart-sidecar": structs.TaskState{
+					State:    structs.TaskStateRunning,
+					Restarts: 0, // TODO: is this true?
+				},
+				"poststart-oneshot": structs.TaskState{
+					State:    structs.TaskStateDead,
+					Restarts: 0, // TODO: is this true?
+				},
+				"poststart-sidecar": structs.TaskState{
+					State:    structs.TaskStateRunning,
+					Restarts: 1, // TODO: is this true?
+				},
+				"poststop": structs.TaskState{
+					State:    structs.TaskStatePending,
+					Restarts: 0,
+				},
+			},
+		},
+
+		{
+			name: "restart prestart-sidecar task",
+			action: func(ar *allocRunner, alloc *structs.Allocation) error {
+				ar.RestartTask("prestart-sidecar", &structs.TaskEvent{})
+				return nil
+			},
+			expectedAfter: map[string]structs.TaskState{
+				"main": structs.TaskState{
+					State:    structs.TaskStateRunning,
+					Restarts: 0, // TODO: is this true?
+				},
+				"prestart-oneshot": structs.TaskState{
+					State:    structs.TaskStateDead,
+					Restarts: 0, // TODO: is this true?
+				},
+				"prestart-sidecar": structs.TaskState{
+					State:    structs.TaskStateRunning,
+					Restarts: 1,
+				},
+				"poststart-oneshot": structs.TaskState{
+					State:    structs.TaskStateDead,
+					Restarts: 0, // TODO: is this true?
+				},
+				"poststart-sidecar": structs.TaskState{
+					State:    structs.TaskStateRunning,
+					Restarts: 0, // TODO: is this true?
+				},
+				"poststop": structs.TaskState{
+					State:    structs.TaskStatePending,
+					Restarts: 0,
+				},
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			require := require.New(t)
+
+			alloc := alloc.Copy()
+
+			conf, cleanup := testAllocRunnerConfig(t, alloc)
+			defer cleanup()
+			ar, err := NewAllocRunner(conf)
+			require.NoError(err)
+			defer destroy(ar)
+			go ar.Run()
+
+			upd := conf.StateUpdater.(*MockStateUpdater)
+
+			// assert our "before" states
+			testutil.WaitForResult(func() (bool, error) {
+				last := upd.Last()
+				if last == nil {
+					return false, fmt.Errorf("no update")
+				}
+				if last.ClientStatus != structs.AllocClientStatusRunning {
+					return false, fmt.Errorf(
+						"expected alloc to be running not %s", last.ClientStatus)
+				}
+				var errs *multierror.Error
+
+				expectedBefore := map[string]string{
+					"main":              structs.TaskStateRunning,
+					"prestart-oneshot":  structs.TaskStateDead,
+					"prestart-sidecar":  structs.TaskStateRunning,
+					"poststart-oneshot": structs.TaskStateDead,
+					"poststart-sidecar": structs.TaskStateRunning,
+					"poststop":          structs.TaskStatePending,
+				}
+
+				for task, expected := range expectedBefore {
+					got := last.TaskStates[task]
+					if got.State != expected {
+						errs = multierror.Append(errs, fmt.Errorf(
+							"expected initial state of task %q to be %q not %q",
+							task, expected, got.State))
+					}
+					if got.Restarts != 0 {
+						errs = multierror.Append(errs, fmt.Errorf(
+							"expected no initial restarts of task %q, not %q",
+							task, got.Restarts))
+					}
+				}
+				if errs.ErrorOrNil() != nil {
+					return false, errs.ErrorOrNil()
+				}
+				return true, nil
+			}, func(err error) {
+				require.NoError(err, "error waiting for initial state")
+			})
+
+			// perform the action
+			tc.action(ar, alloc.Copy())
+
+			// assert our "after" states
+			testutil.WaitForResult(func() (bool, error) {
+				last := upd.Last()
+				if last == nil {
+					return false, fmt.Errorf("no update")
+				}
+				var errs *multierror.Error
+				for task, expected := range tc.expectedAfter {
+					got := last.TaskStates[task]
+					if got.State != expected.State {
+						errs = multierror.Append(errs, fmt.Errorf(
+							"expected final state of task %q to be %q not %q",
+							task, expected.State, got.State))
+					}
+					if got.Restarts != expected.Restarts {
+						errs = multierror.Append(errs, fmt.Errorf(
+							"expected final restarts of task %q to be %v not %v",
+							task, expected.Restarts, got.Restarts))
+					}
+				}
+				if errs.ErrorOrNil() != nil {
+					return false, errs.ErrorOrNil()
+				}
+				return true, nil
+			}, func(err error) {
+				require.NoError(err, "error waiting for final state")
+			})
+		})
+	}
 }
